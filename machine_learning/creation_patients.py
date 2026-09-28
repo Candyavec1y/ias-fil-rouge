@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import numpy as np
 import joblib
 import pandas as pd
 
@@ -50,7 +51,7 @@ class Patient:
     ambulatoire: bool
     duree_bloc: int            # Durée opératoire estimée (en minutes)
     chirurgien_id: int
-    urgent: int                # Entre 1 et 10
+    urgent: int                # Prédit ou forcé (entre 1 et 10)
     nuits_pre_op: int = 0
     nuits_post_op: int = 0
     date_min: Optional[date] = None
@@ -69,6 +70,7 @@ def _get_modeles(repertoire: Path = MODELES_DIR) -> Dict[str, Any]:
             "reg_bloc": joblib.load(repertoire / "reg_duree_bloc.joblib"),
             "reg_avant": joblib.load(repertoire / "reg_duree_avant.joblib"),
             "reg_apres": joblib.load(repertoire / "reg_duree_apres.joblib"),
+            "reg_urgence": joblib.load(repertoire / "reg_urgence.joblib"),
         }
     return _MODELES_CACHE
 
@@ -96,7 +98,7 @@ def creer_patient_consultation(
     ccam_4: Optional[str] = None,
     age: Optional[int] = None,
     chirurgien_id: int = 0,
-    urgent: int = 5,
+    urgent: Optional[int] = None,
     date_min: Optional[date] = None,
 ) -> Patient:
     modeles = _get_modeles()
@@ -133,6 +135,7 @@ def creer_patient_consultation(
     for c in CAT_COLS:
         df_inf[c] = df_inf[c].astype("category")
 
+    # Inférences
     est_ambulatoire = (modeles["clf_capacite"].predict(df_inf)[0] == "ambulatoire")
     bloc_heures = max(0.0, float(modeles["reg_bloc"].predict(df_inf)[0]))
     duree_bloc_min = int(round(bloc_heures * 60))
@@ -144,6 +147,13 @@ def creer_patient_consultation(
         nuits_pre = int(round(max(0.0, float(modeles["reg_avant"].predict(df_inf)[0]))))
         nuits_post = int(round(max(0.0, float(modeles["reg_apres"].predict(df_inf)[0]))))
 
+    # Prédiction de l'urgence si non fournie manuellement
+    if urgent is None:
+        pred_urgence = float(modeles["reg_urgence"].predict(df_inf)[0])
+        urgence_finale = int(np.clip(round(pred_urgence), 1, 10))
+    else:
+        urgence_finale = urgent
+
     return Patient(
         id=id_patient,
         age=age_final,
@@ -153,7 +163,7 @@ def creer_patient_consultation(
         ambulatoire=est_ambulatoire,
         duree_bloc=duree_bloc_min,
         chirurgien_id=chirurgien_id,
-        urgent=urgent,
+        urgent=urgence_finale,
         nuits_pre_op=nuits_pre,
         nuits_post_op=nuits_post,
         date_min=date_min if date_min is not None else dt_ref.date(),
@@ -170,7 +180,6 @@ def charger_patients_depuis_csv(
 ) -> List[Patient]:
     df = pd.read_csv(chemin_csv, delimiter=",", encoding="utf-8", on_bad_lines="warn")
 
-    # Échantillonnage
     n_echantillon = min(n, len(df))
     if random_state is not None:
         df_sample = df.sample(n=n_echantillon, random_state=random_state)
@@ -202,7 +211,7 @@ def charger_patients_depuis_csv(
             anesth_type=str(row[col_anesth_type]) if col_anesth_type and pd.notna(row[col_anesth_type]) else "Inconnu",
             anesth_loco_reg=str(row[col_anesth_loco]) if col_anesth_loco and pd.notna(row[col_anesth_loco]) else "Inconnu",
             interv_type=str(row[col_interv_type]) if col_interv_type and pd.notna(row[col_interv_type]) else "Inconnu",
-            urgent=5,
+            urgent=None,       # Déclenche la prédiction automatique par le ML
             chirurgien_id=0,
         )
         liste_patients.append(patient)
@@ -234,7 +243,7 @@ def afficher_patients(patients: List[Patient]) -> None:
 
 
 if __name__ == "__main__":
-    print("Chargement et prédiction pour 10 patients réels...\n")
+    print("Chargement et prédiction pour 30 patients réels...\n")
     patients_test = charger_patients_depuis_csv(
         chemin_csv="donnees_hospitalieres.csv",
         n=30,

@@ -96,6 +96,8 @@ def charger_et_preparer(raw_path=RAW_PATH):
     heure_incision_col = trouver_colonne(['heure', 'incision'], df)
     type_intervention_col = trouver_colonne(['interv', 'type'], df)
     date_naissance_col = trouver_colonne(['date', 'naissance'], df)
+    cim_diag_pr_col = trouver_colonne(['cim', 'diag', 'pr'], df)
+    ccam_1_col = trouver_colonne(['ccam', '1'], df)
 
     df[date_entree_col] = pd.to_datetime(df[date_entree_col], dayfirst=True, errors='coerce')
     df[date_sortie_col] = pd.to_datetime(df[date_sortie_col], dayfirst=True, errors='coerce')
@@ -140,13 +142,41 @@ def charger_et_preparer(raw_path=RAW_PATH):
     df['mois'] = df[date_intervention_col].dt.month
     df['jour_semaine'] = df[date_intervention_col].dt.dayofweek
 
+    # --- DÉDUCTION DU SCORE D'URGENCE (1 à 10) ---
+    def calculer_score_urgence(row):
+        cim = str(row.get(cim_diag_pr_col, '')).upper().strip()
+        ccam = str(row.get(ccam_1_col, '')).upper().strip()
+
+        # 1. URGENCE TRÈS ÉLEVÉE (8 à 10) : fractures, traumatismes aigus, plaies, hémostase
+        if cim.startswith(('S', 'T')):
+            return 9
+        if any(ccam.startswith(p) for p in ['PAGA', 'PCPA', 'NAQK', 'NDQK', 'NDPA', 'MDQK', 'MFPA', 'MGQK']):
+            return 8
+
+        # 2. SEMI-URGENT (5 à 7) : infections cutanées, abcès
+        if cim.startswith(('L02', 'L03', 'K80', 'K81')):
+            return 6
+
+        # 3. AMBULATOIRE / PETITE CHIRURGIE PROGRAMMÉE (3 à 4)
+        if cim.startswith(('M20', 'L60', 'G56', 'M72', 'M65', 'M70')) or any(ccam.startswith(p) for p in ['NFMA', 'NFMC', 'MJFA', 'MEMC', 'QZFA', 'QZJA', 'EJSA']):
+            return 3
+
+        # 4. CHIRURGIE LOURDE FROIDE / RÉGLÉE (1 à 2)
+        if cim.startswith(('M16', 'M17', 'M48', 'M50', 'M51', 'Z47')) or any(ccam.startswith(p) for p in ['NFKA', 'NEKA', 'NEQK']):
+            return 1
+
+        # Reste : programmation élective standard
+        return 3
+
+    df['urgence'] = df.apply(calculer_score_urgence, axis=1)
+
     df = df.rename(columns={type_intervention_col: 'type_intervention'})
 
     keep = ['no_cas', 'type_intervention', 'cim_diag_pr', 'ccam_1', 'sexe',
             'praticien', 'anesth_type', 'anesth_loco_reg',
             'age_annees', 'annee', 'mois', 'jour_semaine',
             'duree_avant_operation', 'duree_bloc_heures', 'duree_apres_operation',
-            'type_capacite']
+            'type_capacite', 'urgence']
     df = df[[c for c in keep if c in df.columns]].copy()
 
     for c in CAT_COLS:
@@ -154,11 +184,6 @@ def charger_et_preparer(raw_path=RAW_PATH):
 
     df = df.dropna(subset=['duree_avant_operation', 'duree_bloc_heures', 'duree_apres_operation'])
 
-    # HistGradientBoosting (contrairement à CatBoost) plafonne le nombre de
-    # catégories natives à 255. type_intervention/cim_diag_pr/ccam_1 en ont
-    # beaucoup plus (jusqu'à ~1400) -> on regroupe les catégories les plus
-    # rares dans "Autre" pour rester sous la limite (et éviter l'overfitting
-    # sur des catégories vues 1 ou 2 fois).
     for c in ["type_intervention", "cim_diag_pr", "ccam_1"]:
         df[c] = limiter_cardinalite(df[c], max_categories=200)
 
@@ -247,6 +272,9 @@ if __name__ == "__main__":
     clf_capacite = entrainer_classification_rapide(X_all, df['type_capacite'])
     reg_bloc = entrainer_regression_rapide(X_all, df['duree_bloc_heures'], "duree_bloc_heures")
 
+    # --- MODÈLE D'URGENCE ---
+    reg_urgence = entrainer_regression_rapide(X_all, df['urgence'], "degre_urgence")
+
     df_lit = df[df['type_capacite'] == 'lit_classique']
     X_lit = df_lit[CAT_COLS + NUM_COLS]
     reg_avant = entrainer_regression_rapide(X_lit, df_lit['duree_avant_operation'], "duree_avant_operation")
@@ -256,5 +284,6 @@ if __name__ == "__main__":
     joblib.dump(reg_bloc, OUTPUT_DIR / "reg_duree_bloc.joblib")
     joblib.dump(reg_avant, OUTPUT_DIR / "reg_duree_avant.joblib")
     joblib.dump(reg_apres, OUTPUT_DIR / "reg_duree_apres.joblib")
+    joblib.dump(reg_urgence, OUTPUT_DIR / "reg_urgence.joblib")
 
     print(f"\n✅ Terminé en {time.time() - t_debut:.1f} secondes. Modèles sauvegardés dans {OUTPUT_DIR}")

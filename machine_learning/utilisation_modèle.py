@@ -98,6 +98,8 @@ def charger_et_preparer(raw_path=RAW_PATH):
     heure_incision_col = trouver_colonne(['heure', 'incision'], df)
     type_intervention_col = trouver_colonne(['interv', 'type'], df)
     date_naissance_col = trouver_colonne(['date', 'naissance'], df)
+    cim_diag_pr_col = trouver_colonne(['cim', 'diag', 'pr'], df)
+    ccam_1_col = trouver_colonne(['ccam', '1'], df)
 
     df[date_entree_col] = pd.to_datetime(df[date_entree_col], dayfirst=True, errors='coerce')
     df[date_sortie_col] = pd.to_datetime(df[date_sortie_col], dayfirst=True, errors='coerce')
@@ -142,13 +144,40 @@ def charger_et_preparer(raw_path=RAW_PATH):
     df['mois'] = df[date_intervention_col].dt.month
     df['jour_semaine'] = df[date_intervention_col].dt.dayofweek
 
+    # --- DÉDUCTION DU SCORE D'URGENCE (1 à 10) ---
+    def calculer_score_urgence(row):
+        cim = str(row.get(cim_diag_pr_col, '')).upper().strip()
+        ccam = str(row.get(ccam_1_col, '')).upper().strip()
+
+        # 1. URGENCE TRÈS ÉLEVÉE (8 à 10) : traumatologie aiguë et plaies
+        if cim.startswith(('S', 'T')):
+            return 9
+        if any(ccam.startswith(p) for p in ['PAGA', 'PCPA', 'NAQK', 'NDQK', 'NDPA', 'MDQK', 'MFPA', 'MGQK']):
+            return 8
+
+        # 2. SEMI-URGENT (5 à 7) : infections cutanées, abcès
+        if cim.startswith(('L02', 'L03', 'K80', 'K81')):
+            return 6
+
+        # 3. AMBULATOIRE / PETITE CHIRURGIE PROGRAMMÉE (3 à 4)
+        if cim.startswith(('M20', 'L60', 'G56', 'M72', 'M65', 'M70')) or any(ccam.startswith(p) for p in ['NFMA', 'NFMC', 'MJFA', 'MEMC', 'QZFA', 'QZJA', 'EJSA']):
+            return 3
+
+        # 4. CHIRURGIE LOURDE FROIDE / RÉGLÉE (1 à 2)
+        if cim.startswith(('M16', 'M17', 'M48', 'M50', 'M51', 'Z47')) or any(ccam.startswith(p) for p in ['NFKA', 'NEKA', 'NEQK']):
+            return 1
+
+        return 3
+
+    df['urgence'] = df.apply(calculer_score_urgence, axis=1)
+
     df = df.rename(columns={type_intervention_col: 'type_intervention'})
 
     keep = ['no_cas', 'type_intervention', 'cim_diag_pr', 'ccam_1', 'sexe',
             'praticien', 'anesth_type', 'anesth_loco_reg',
             'age_annees', 'annee', 'mois', 'jour_semaine',
             'duree_avant_operation', 'duree_bloc_heures', 'duree_apres_operation',
-            'type_capacite']
+            'type_capacite', 'urgence']
     df = df[[c for c in keep if c in df.columns]].copy()
 
     for c in CAT_COLS:
@@ -201,6 +230,13 @@ def valider_sur_jeu_de_test():
     reg_bloc.fit(Xc_train, df_train['duree_bloc_heures'])
     bloc_pred_test = np.clip(reg_bloc.predict(Xc_test), 0, None)
 
+    reg_urgence = HistGradientBoostingRegressor(
+        max_depth=6, learning_rate=0.08, max_iter=200,
+        categorical_features=[c in CAT_COLS for c in (CAT_COLS + NUM_COLS)],
+        early_stopping=True, random_state=RANDOM_STATE)
+    reg_urgence.fit(Xc_train, df_train['urgence'])
+    urgence_pred_test = np.clip(np.round(reg_urgence.predict(Xc_test)), 1, 10).astype(int)
+
     train_lit = df_train[df_train['type_capacite'] == 'lit_classique']
     Xc_train_lit = _to_category(train_lit[CAT_COLS + NUM_COLS])
 
@@ -240,6 +276,7 @@ def valider_sur_jeu_de_test():
         ("duree_bloc_heures", df_test['duree_bloc_heures'], bloc_pred_test),
         ("duree_avant_operation (pipeline complet)", df_test['duree_avant_operation'], avant_pred_test),
         ("duree_apres_operation (pipeline complet)", df_test['duree_apres_operation'], apres_pred_test),
+        ("urgence (score 1-10)", df_test['urgence'], urgence_pred_test),
     ]:
         mae = mean_absolute_error(y_true, y_pred)
         rmse = np.sqrt(mean_squared_error(y_true, y_pred))
@@ -253,16 +290,16 @@ def valider_sur_jeu_de_test():
 
     echantillon = df_test.sample(n=min(15, len(df_test)), random_state=1).index
 
-    # Tableau scindé en 2 (capacité+bloc / avant+après) pour ne pas se faire
-    # tronquer par la largeur de la console (ex. dans Thonny).
     tableau_1 = pd.DataFrame({
         "type_intervention": df_test.loc[echantillon, "type_intervention"].str.slice(0, 22),
         "capacite_reelle": df_test.loc[echantillon, "type_capacite"],
         "capacite_predite": pd.Series(cap_pred_test, index=df_test.index).loc[echantillon],
         "bloc_h_reel": df_test.loc[echantillon, "duree_bloc_heures"].round(2),
         "bloc_h_predit": pd.Series(bloc_pred_test, index=df_test.index).loc[echantillon].round(2),
+        "urg_reelle": df_test.loc[echantillon, "urgence"],
+        "urg_predite": pd.Series(urgence_pred_test, index=df_test.index).loc[echantillon],
     })
-    print("\n-- Capacité + durée bloc --")
+    print("\n-- Capacité + durée bloc + urgence --")
     print(tableau_1.to_string(index=False))
 
     tableau_2 = pd.DataFrame({
@@ -279,7 +316,7 @@ def valider_sur_jeu_de_test():
     print("\n-- Durée avant / après opération (la donnée clé pour l'occupation des lits) --")
     print(tableau_2.to_string(index=False))
 
-    # --- Pires erreurs, sur les 3 durées séparément ---
+    # --- Pires erreurs, sur les 3 durées + urgence séparément ---
     erreurs_bloc = pd.DataFrame({
         "type_intervention": df_test["type_intervention"],
         "bloc_h_reel": df_test["duree_bloc_heures"],
@@ -320,8 +357,19 @@ def valider_sur_jeu_de_test():
     print("=" * 70)
     print(erreurs_avant.head(10).to_string(index=False))
 
-    # --- Répartition des erreurs sur la durée après opération (utile pour
-    #     juger si le modèle est utilisable tel quel pour l'ordonnancement) ---
+    erreurs_urgence = pd.DataFrame({
+        "type_intervention": df_test["type_intervention"],
+        "urg_reelle": df_test["urgence"],
+        "urg_predite": urgence_pred_test,
+        "erreur_abs_urg": np.abs(df_test["urgence"].values - urgence_pred_test),
+    }).sort_values("erreur_abs_urg", ascending=False)
+
+    print("\n" + "=" * 70)
+    print("PIRES ERREURS — score d'urgence (top 10)")
+    print("=" * 70)
+    print(erreurs_urgence.head(10).to_string(index=False))
+
+    # --- Répartition des erreurs sur la durée après opération ---
     erreur_apres_abs = np.abs(df_test["duree_apres_operation"].values - apres_pred_test)
     print("\n" + "=" * 70)
     print("RÉPARTITION DE L'ERREUR — durée après opération (en jours)")
@@ -329,6 +377,15 @@ def valider_sur_jeu_de_test():
     for seuil in [0.5, 1, 2, 3]:
         pct = (erreur_apres_abs <= seuil).mean() * 100
         print(f"  Erreur ≤ {seuil} jour(s) : {pct:.1f}% des patients du jeu de test")
+
+    # --- Répartition des erreurs sur l'urgence ---
+    erreur_urg_abs = np.abs(df_test["urgence"].values - urgence_pred_test)
+    print("\n" + "=" * 70)
+    print("RÉPARTITION DE L'ERREUR — score d'urgence")
+    print("=" * 70)
+    for seuil in [0, 1, 2]:
+        pct = (erreur_urg_abs <= seuil).mean() * 100
+        print(f"  Écart ≤ {seuil} point(s) : {pct:.1f}% des patients du jeu de test")
 
 
 # =====================================================================
@@ -340,6 +397,7 @@ def charger_modeles_production():
         "reg_bloc": joblib.load(MODELES_DIR / "reg_duree_bloc.joblib"),
         "reg_avant": joblib.load(MODELES_DIR / "reg_duree_avant.joblib"),
         "reg_apres": joblib.load(MODELES_DIR / "reg_duree_apres.joblib"),
+        "reg_urgence": joblib.load(MODELES_DIR / "reg_urgence.joblib"),
     }
 
 
@@ -350,10 +408,12 @@ def predire_patient(patient: dict, modeles: dict) -> dict:
 
     capacite = modeles["clf_capacite"].predict(X_new)[0]
     bloc = max(0.0, float(modeles["reg_bloc"].predict(X_new)[0]))
+    urg = int(np.clip(round(float(modeles["reg_urgence"].predict(X_new)[0])), 1, 10))
 
     resultat = {
         "type_capacite_predit": capacite,
         "duree_bloc_heures_predit": round(bloc, 2),
+        "urgence_predite": urg,
     }
     if capacite == "lit_classique":
         avant = max(0.0, float(modeles["reg_avant"].predict(X_new)[0]))
@@ -370,17 +430,23 @@ def tester_cas_fictifs():
     modeles = charger_modeles_production()
 
     cas_pratiques = {
-        "PTH chez patient âgé (attendu : lit classique, durées longues)": {
+        "PTH chez patient âgé (attendu : lit classique, durées longues, urgence basse 1-2)": {
             "type_intervention": "Prothese Totale Hanche", "cim_diag_pr": "M16.1",
             "ccam_1": "NEKA020", "sexe": "1", "praticien": "CL",
             "anesth_type": "AG avec intubation", "anesth_loco_reg": "Inconnu",
             "age_annees": 78, "annee": 2026, "mois": 3, "jour_semaine": 1,
         },
-        "Arthroscopie genou jeune patient (attendu : ambulatoire, bloc court)": {
+        "Arthroscopie genou jeune patient (attendu : ambulatoire, bloc court, urgence modérée)": {
             "type_intervention": "Arthroscopie Genou", "cim_diag_pr": "S83.2",
             "ccam_1": "NFEA001", "sexe": "2", "praticien": "LZ",
             "anesth_type": "AG avec masque laryngé", "anesth_loco_reg": "Bloc coude",
             "age_annees": 24, "annee": 2026, "mois": 6, "jour_semaine": 3,
+        },
+        "Fracture diaphysaire fémur (attendu : lit classique, urgence haute 8-9)": {
+            "type_intervention": "Osteosynthese Femur", "cim_diag_pr": "S72.3",
+            "ccam_1": "NDQK001", "sexe": "1", "praticien": "Inconnu",
+            "anesth_type": "AG avec intubation", "anesth_loco_reg": "Inconnu",
+            "age_annees": 45, "annee": 2026, "mois": 2, "jour_semaine": 2,
         },
         "Chirurgie non vue à l'entraînement (attendu : le modèle doit quand même répondre)": {
             "type_intervention": "Intervention totalement inconnue XYZ", "cim_diag_pr": "Z99.9",
