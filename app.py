@@ -7,7 +7,7 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Planification du bloc opératoire", page_icon="", layout="wide")
+st.set_page_config(page_title="Planification du bloc opératoire", page_icon="🏥", layout="wide")
 
 JOURS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
 # À aligner avec les valeurs de donnees_hospitalieres.csv
@@ -89,8 +89,8 @@ with st.sidebar:
 def page_accueil():
     st.title("🏥 Planification du bloc opératoire")
     st.subheader(f"Bonjour {ss.medecin}")
-    tuiles = [("  Planning", "planning"), ("  Ajouter un patient", "ajout"),
-              ("  Mes patients", "patients"), ("⚙️  Administration", "admin")]
+    tuiles = [("📅  Planning", "planning"), ("👤  Ajouter un patient", "ajout"),
+              ("👥  Mes patients", "patients"), ("⚙️  Administration", "admin")]
     for i in range(0, 4, 2):
         cols = st.columns(2)
         for col, (label, page) in zip(cols, tuiles[i:i + 2]):
